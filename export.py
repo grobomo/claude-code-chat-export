@@ -23,6 +23,8 @@ def parse_args():
     p.add_argument('--landing', action='store_true', help='Regenerate landing page only')
     p.add_argument('--all', action='store_true', help='Export all sessions for current project')
     p.add_argument('--project-path', help='Project working directory path')
+    p.add_argument('--format', choices=['html', 'md'], default='html',
+                   help='Output format: html (default) or md (Markdown)')
     return p.parse_args()
 
 def find_current_session():
@@ -433,6 +435,102 @@ def generate_raw_text(messages):
 
         lines.append('')
     return '\n'.join(lines)
+
+
+def generate_markdown(messages, out_path, session_name="Session", project_name="project", branch="main", project_path="~/project"):
+    """Generate Markdown export from parsed conversation turns."""
+    lines = []
+    lines.append(f'# {session_name}')
+    lines.append('')
+    lines.append(f'- **Project**: {project_name}')
+    lines.append(f'- **Branch**: {branch}')
+    lines.append(f'- **Path**: `{project_path}`')
+    if messages and messages[0].get('timestamp'):
+        try:
+            dt = datetime.fromisoformat(messages[0]['timestamp'].replace('Z', '+00:00'))
+            lines.append(f'- **Date**: {dt.strftime("%Y-%m-%d %H:%M")}')
+        except Exception:
+            pass
+    lines.append(f'- **Turns**: {len(messages)}')
+    lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    for turn in messages:
+        role_label = 'User' if turn['role'] == 'user' else 'Assistant'
+        lines.append(f'## {role_label}')
+        lines.append('')
+
+        for text in turn['texts']:
+            lines.append(text)
+            lines.append('')
+
+        for tool in turn.get('tool_uses', []):
+            name = tool['name']
+            inp = tool['input']
+            lines.append(f'### Tool: {name}')
+            lines.append('')
+            lines.append('```')
+            # Concise tool formatting
+            if name == 'Bash':
+                lines.append(inp.get('command', ''))
+            elif name == 'Read' and inp.get('file_path'):
+                lines.append(inp['file_path'])
+            elif name == 'Write' and inp.get('file_path'):
+                content = inp.get('content', '')
+                if len(content) > 500:
+                    content = content[:500] + '\n... (truncated)'
+                lines.append(f'Write: {inp["file_path"]}')
+                lines.append(content)
+            elif name == 'Edit' and inp.get('file_path'):
+                old = inp.get('old_string', '')
+                new = inp.get('new_string', '')
+                if len(old) > 200: old = old[:200] + '...'
+                if len(new) > 200: new = new[:200] + '...'
+                lines.append(f'Edit: {inp["file_path"]}')
+                lines.append(f'- {old}')
+                lines.append(f'+ {new}')
+            elif name == 'Grep' and inp.get('pattern'):
+                lines.append(f'grep "{inp["pattern"]}" {inp.get("path", ".")}')
+            elif name == 'Glob' and inp.get('pattern'):
+                lines.append(f'glob "{inp["pattern"]}" {inp.get("path", ".")}')
+            elif name == 'Skill':
+                lines.append(f'/{inp.get("skill", "")}' + (f' {inp["args"]}' if inp.get('args') else ''))
+            elif name == 'WebSearch':
+                lines.append(f'search: {inp.get("query", "")}')
+            elif name == 'WebFetch':
+                lines.append(f'fetch {inp.get("url", "")}')
+            elif name == 'Task':
+                lines.append(f'Task: {inp.get("description", "")}')
+                if inp.get('subagent_type'):
+                    lines.append(f'Agent: {inp["subagent_type"]}')
+            else:
+                for k, v in inp.items():
+                    val = json.dumps(v, indent=2) if isinstance(v, (dict, list)) else str(v)
+                    if len(val) > 500: val = val[:500] + '...'
+                    lines.append(f'{k}: {val}')
+            lines.append('```')
+            lines.append('')
+
+            if tool.get('result'):
+                result = tool['result']
+                if len(result) > 2000:
+                    result = result[:2000] + f'\n... ({len(tool["result"])} chars)'
+                lines.append('<details>')
+                lines.append('<summary>Tool Result</summary>')
+                lines.append('')
+                lines.append('```')
+                lines.append(result)
+                lines.append('```')
+                lines.append('')
+                lines.append('</details>')
+                lines.append('')
+
+    md_content = '\n'.join(lines)
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(md_content)
+    return out_path
 
 
 def generate_html(messages, out_path, session_name="Session", project_name="project", branch="main", project_path="~/project", screenshot_dir=None):
@@ -1412,6 +1510,10 @@ if __name__ == '__main__':
             print(f'Landing page: {lp}')
         sys.exit(0)
 
+    # Output format
+    fmt = getattr(args, 'format', 'html')
+    ext = '.md' if fmt == 'md' else '.html'
+
     # Export all sessions mode
     if getattr(args, 'all', False):
         sessions = find_project_sessions()
@@ -1432,19 +1534,26 @@ if __name__ == '__main__':
                 project_dir = os.path.join(EXPORTS_DIR, pname)
                 os.makedirs(project_dir, exist_ok=True)
                 safe_name = re.sub(r'[^a-zA-Z0-9-]', '-', sname.lower())[:50]
-                opath = os.path.join(project_dir, f'{safe_name}.html')
-                out = generate_html(msgs, opath, session_name=sname,
-                                    project_name=pname, branch=br,
-                                    project_path=ppath, screenshot_dir=args.screenshots)
+                opath = os.path.join(project_dir, f'{safe_name}{ext}')
+                if fmt == 'md':
+                    out = generate_markdown(msgs, opath, session_name=sname,
+                                            project_name=pname, branch=br,
+                                            project_path=ppath)
+                else:
+                    out = generate_html(msgs, opath, session_name=sname,
+                                        project_name=pname, branch=br,
+                                        project_path=ppath, screenshot_dir=args.screenshots)
                 size = os.path.getsize(out)
                 size_str = f'{size/1024/1024:.1f} MB' if size > 1024*1024 else f'{size/1024:.0f} KB'
                 print(f'  {sname[:40]:40s} {len(msgs):5d} turns  {size_str:>8s}  -> {out}')
-                update_manifest(EXPORTS_DIR, pname, sname, out, br, len(msgs))
+                if fmt == 'html':
+                    update_manifest(EXPORTS_DIR, pname, sname, out, br, len(msgs))
             except Exception as e:
                 print(f'  ERROR: {jsonl_path}: {e}')
-        lp = generate_landing_page(EXPORTS_DIR)
-        if lp:
-            print(f'Landing page: {lp}')
+        if fmt == 'html':
+            lp = generate_landing_page(EXPORTS_DIR)
+            if lp:
+                print(f'Landing page: {lp}')
         sys.exit(0)
 
     # Resolve JSONL path
@@ -1474,12 +1583,17 @@ if __name__ == '__main__':
         project_dir = os.path.join(EXPORTS_DIR, project_name)
         os.makedirs(project_dir, exist_ok=True)
         safe_name = re.sub(r'[^a-zA-Z0-9-]', '-', session_name.lower())[:50]
-        out_path = os.path.join(project_dir, f'{safe_name}.html')
+        out_path = os.path.join(project_dir, f'{safe_name}{ext}')
 
-    # Generate HTML
-    out = generate_html(msgs, out_path, session_name=session_name,
-                        project_name=project_name, branch=branch,
-                        project_path=project_path, screenshot_dir=screenshot_dir)
+    # Generate output
+    if fmt == 'md':
+        out = generate_markdown(msgs, out_path, session_name=session_name,
+                                project_name=project_name, branch=branch,
+                                project_path=project_path)
+    else:
+        out = generate_html(msgs, out_path, session_name=session_name,
+                            project_name=project_name, branch=branch,
+                            project_path=project_path, screenshot_dir=screenshot_dir)
     print(f'Exported to: {out}')
     size = os.path.getsize(out)
     if size > 1024*1024:
@@ -1487,9 +1601,10 @@ if __name__ == '__main__':
     else:
         print(f'Size: {size/1024:.0f} KB')
 
-    # Update manifest and landing page
-    os.makedirs(EXPORTS_DIR, exist_ok=True)
-    update_manifest(EXPORTS_DIR, project_name, session_name, out, branch, len(msgs))
-    lp = generate_landing_page(EXPORTS_DIR)
-    if lp:
-        print(f'Landing page: {lp}')
+    # Update manifest and landing page (HTML only)
+    if fmt == 'html':
+        os.makedirs(EXPORTS_DIR, exist_ok=True)
+        update_manifest(EXPORTS_DIR, project_name, session_name, out, branch, len(msgs))
+        lp = generate_landing_page(EXPORTS_DIR)
+        if lp:
+            print(f'Landing page: {lp}')
